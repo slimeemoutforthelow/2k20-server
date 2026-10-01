@@ -1,0 +1,14 @@
+{
+  "name": "2k20-private-server",
+  "version": "1.0.0",
+  "description": "NBA 2K20 Private Server - works with Covid20Redirect.dll",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "pm2": "pm2 start server.js --name 2k20-server --restart-delay 3000"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  }
+}
