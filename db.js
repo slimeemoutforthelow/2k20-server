@@ -1,19 +1,42 @@
 'use strict';
 /**
- * In-memory member store.
- * All data is lost on restart — swap the Map for SQLite/JSON file for persistence.
+ * Persistent member store — writes to ./data/members.json
+ * so members survive Render free-tier restarts.
  */
 
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('node:crypto');
+const fs     = require('node:fs');
+const path   = require('node:path');
+
+const DATA_DIR  = path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'members.json');
+
+// ── Persistence ───────────────────────────────────────────────────────────────
+function loadMembers() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(DATA_FILE)) return new Map();
+    const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    return new Map(Object.entries(raw));
+  } catch { return new Map(); }
+}
+
+function saveMembers() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    const obj = Object.fromEntries(members);
+    fs.writeFileSync(DATA_FILE, JSON.stringify(obj, null, 2), 'utf8');
+  } catch (e) { console.error('[db] save failed:', e.message); }
+}
 
 // key: memberKey  value: { memberId, memberCode, nativeUserIdHex, joinedAt }
-const members = new Map();
+const members = loadMembers();
 
-// key: memberKey  value: session object
+// key: memberKey  value: session object (rebuilt from members on demand)
 const sessions = new Map();
 
-const JOIN_KEY   = process.env.NOSTALGIA_JOIN_KEY || 'fuUEsQMS8nUbp2Y4KCzBUzqYQZFAGfWKcRYKNTF92Ck';
+const JOIN_KEY    = process.env.NOSTALGIA_JOIN_KEY || 'fuUEsQMS8nUbp2Y4KCzBUzqYQZFAGfWKcRYKNTF92Ck';
 const MAX_MEMBERS = parseInt(process.env.MAX_MEMBERS || '50', 10);
 
 function generateMemberCode(memberId) {
@@ -35,6 +58,7 @@ function enroll(memberKey, joinKey) {
     const memberCode      = generateMemberCode(memberId);
     const nativeUserIdHex = generateNativeUserId();
     members.set(memberKey, { memberId, memberCode, nativeUserIdHex, joinedAt: Date.now() });
+    saveMembers();
     console.log(`[enroll] new member ${memberCode}  total=${members.size}`);
   }
   return { ok: true, status: 200 };
@@ -72,7 +96,7 @@ function linkSteam(memberKey, steamId, personaName) {
   s.steamNameState      = 'ready';
   s.displayName         = personaName + ' [' + s.memberCode + ']';
   const m = members.get(memberKey);
-  if (m) m.nativeUserIdHex = s.nativeUserIdHex;
+  if (m) { m.nativeUserIdHex = s.nativeUserIdHex; saveMembers(); }
   return true;
 }
 
@@ -85,7 +109,7 @@ function unlinkSteam(memberKey) {
   s.steamNameState      = 'not-linked';
   s.displayName         = 'Player [' + s.memberCode + ']';
   const m = members.get(memberKey);
-  if (m) m.nativeUserIdHex = newId;
+  if (m) { m.nativeUserIdHex = newId; saveMembers(); }
   return true;
 }
 
@@ -95,7 +119,7 @@ const lockerCodes = new Map();
 
 function redeemLockerCode(memberKey, code) {
   const entry = lockerCodes.get(String(code || '').toUpperCase());
-  if (!entry)                   return { ok: false, error: 'code-not-found' };
+  if (!entry)                       return { ok: false, error: 'code-not-found' };
   if (entry.claimed.has(memberKey)) return { ok: false, error: 'already-claimed' };
   entry.claimed.add(memberKey);
   return { ok: true, vc: entry.vc };

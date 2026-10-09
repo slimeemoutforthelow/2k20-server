@@ -68,8 +68,8 @@ app.get('/health', (req, res) => {
   if (!session) return res.status(403).json({ error: 'invite-rejected' });
 
   res.status(200).json({
-    service:                     'nostalgia-2k19-protocol-gateway',
-    protocolRevision:            '2k19-community-private-v10',
+    service:                     'nostalgia-2k20-protocol-gateway',
+    protocolRevision:            '2k20-community-private-v10',
     // Identity
     memberIdentityVersion:       1,
     nativeDisplayNameVersion:    1,
@@ -167,6 +167,64 @@ app.get('/nba/2k19/community/steam/friends/snapshot', (req, res) => {
 // ── 9. Catch-all for /nba/2k19/ ──────────────────────────────────────────────
 app.all('/nba/2k19/*', (_req, res) => {
   res.status(404).json({ error: 'route-not-supported' });
+});
+
+// ── 10. NBA 2K19/2K20 game-protocol routes ───────────────────────────────────
+// The DLL redirects nba2k19-ws.2ksports.com (and nba2k20-ws fallback) to
+// loopback:20218. These stubs return enough for the game to stay online.
+
+// Session/login — very first call the game makes after connecting
+app.post('/Session/login', (req, res) => {
+  res.status(200).json({
+    status: 'success',
+    sessionId: '00000000000000000000000000000001',
+    userId: '0', personaId: '0',
+    displayName: 'Player', isUnderage: false,
+  });
+});
+
+app.post('/nba/2k20/Session/update', (req, res) => {
+  res.status(200).json({ status: 'success', sessionId: '00000000000000000000000000000001' });
+});
+
+app.post('/nba/2k20/Accounts/get_account', (req, res) => {
+  const mk = req.headers['x-nostalgia-member-key'];
+  const session = (typeof mk === 'string' && /^[A-Za-z0-9_-]{43}$/.test(mk)) ? db.getSession(mk) : null;
+  res.status(200).json({
+    status: 'success', personaId: '0', userId: '0',
+    displayName: session ? session.displayName : 'Player',
+    avatarId: 0, avatarUrl: '', showPersonaName: true,
+  });
+});
+
+app.post('/nba/2k20/Accounts/update_account', (_req, res) => {
+  res.status(200).json({ status: 'success' });
+});
+
+app.post('/nba/2k20/VirtualCurrency/get_balance', (req, res) => {
+  const mk = req.headers['x-nostalgia-member-key'];
+  const session = (typeof mk === 'string' && /^[A-Za-z0-9_-]{43}$/.test(mk)) ? db.getSession(mk) : null;
+  res.status(200).json({ status: 'success', vcBalance: session ? (session.vcBalance || 0) : 0 });
+});
+
+app.post('/nba/2k20/VirtualCurrency/purchase_attributes', (_req, res) => {
+  res.status(200).json({ status: 'success', vcBalance: 0 });
+});
+
+app.post('/nba/2k20/MyCareer/save',                  (_req, res) => res.status(200).json({ status: 'success' }));
+app.post('/nba/2k20/MyCareer/Attributes/get',        (_req, res) => res.status(200).json({ status: 'success', attributes: [] }));
+app.post('/nba/2k20/MyCareer/Attributes/price',      (_req, res) => res.status(200).json({ status: 'success', prices: [] }));
+app.post('/nba/2k20/UserData/enumerate',             (_req, res) => res.status(200).json({ status: 'success', files: [] }));
+app.post('/nba/2k20/UserData/download',              (_req, res) => res.status(200).json({ status: 'success', data: null }));
+app.post('/nba/2k20/UserData/upload',                (_req, res) => res.status(200).json({ status: 'success' }));
+app.post('/nba/2k20/Store/inventory',                (_req, res) => res.status(200).json({ status: 'success', items: [] }));
+app.post('/nba/2k20/Text/validate',                  (_req, res) => res.status(200).json({ status: 'success', approved: true }));
+app.post('/nba/2k20/Park/search',                    (_req, res) => res.status(200).json({ status: 'success', sessions: [] }));
+app.post('/nba/2k20/SteamFriends/whos-online',       (_req, res) => res.status(200).json({ status: 'success', friends: [] }));
+
+// Catch-all for any other /nba/2k20/ paths the game may call
+app.all('/nba/2k20/*', (_req, res) => {
+  res.status(200).json({ status: 'success' });
 });
 
 // ── HTTP + WebSocket server ───────────────────────────────────────────────────
