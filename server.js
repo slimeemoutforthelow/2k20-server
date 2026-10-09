@@ -37,6 +37,7 @@ function getMemberKey(req) {
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '8kb' }));
+app.use(express.raw({ type: '*/*', limit: '1mb' }));
 
 // ── 1. Enroll / join ──────────────────────────────────────────────────────────
 // Called by connection-bridge.js --community-enroll
@@ -174,7 +175,9 @@ app.all('/nba/2k19/*', (_req, res) => {
 // loopback:20218. These stubs return enough for the game to stay online.
 
 // Session/login — very first call the game makes after connecting
-app.post('/Session/login', (req, res) => {
+// Accept any method/content-type; the game may send binary or form data.
+app.all('/Session/login', (req, res) => {
+  console.log('[session/login]', req.method, 'ct:', req.headers['content-type'], 'len:', req.headers['content-length'], 'http:', req.httpVersion);
   res.status(200).json({
     status: 'success',
     sessionId: '00000000000000000000000000000001',
