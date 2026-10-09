@@ -1,208 +1,224 @@
 'use strict';
 /**
- * NBA 2K20 Private Server
- * Works with Covid20Redirect.dll — handles raw TCP on port 45323,
- * legacy login on 30217, virtual channel on 20055,
- * and HTTP/HTTPS spoof for 2K dead auth servers.
+ * Nostalgia 2K19 Community Server
+ *
+ * Endpoints the connection-bridge.js client expects:
+ *
+ *  POST /_nostalgia/community/join
+ *  GET  /health
+ *  WS   /nba/2k19/park/connect
+ *  POST /nba/2k19/community/locker-code/redeem
+ *  GET  /nba/2k19/community/steam/link/status
+ *  POST /nba/2k19/community/steam/link/start
+ *  POST /nba/2k19/community/steam/link/confirm
+ *  POST /nba/2k19/community/steam/link/unlink
+ *  GET  /nba/2k19/community/steam/friends/snapshot
+ *
+ * Run:  node src/server.js
+ * Env:  PORT               (default 3000)
+ *       NOSTALGIA_JOIN_KEY (43-char base64url — must match community-invite.json joinKey)
  */
 
-const net     = require('net');
-const http    = require('http');
-const https   = require('https');
-const fs      = require('fs');
-const path    = require('path');
+const http    = require('node:http');
+const { WebSocketServer } = require('ws');
 const express = require('express');
-const cors    = require('cors');
+const db      = require('./db');
 
-const CERT_PATH = path.join(__dirname, 'cert.pem');
-const KEY_PATH  = path.join(__dirname, 'cert.key');
+const PORT  = parseInt(process.env.PORT || '3000', 10);
+const KEY_RE = /^[A-Za-z0-9_-]{43}$/;
 
-// ── TLS cert (for HTTPS spoof) ────────────────────────────────────────────────
-let tlsOptions = null;
-try {
-  tlsOptions = { cert: fs.readFileSync(CERT_PATH), key: fs.readFileSync(KEY_PATH) };
-  console.log('  TLS cert loaded.');
-} catch {
-  console.log('  [!] No TLS cert found — run gen-cert.sh to generate one.');
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function getMemberKey(req) {
+  const k = req.headers['x-nostalgia-member-key'];
+  return typeof k === 'string' && KEY_RE.test(k) ? k : null;
 }
 
-// ── Connected players ─────────────────────────────────────────────────────────
-const players = new Map(); // socketId -> { socket, addr, connectedAt }
-let nextId = 1;
+// ── Express app ───────────────────────────────────────────────────────────────
+const app = express();
+app.disable('x-powered-by');
+app.use(express.json({ limit: '8kb' }));
 
-function log(msg) { console.log(`[${new Date().toTimeString().slice(0,8)}] ${msg}`); }
+// ── 1. Enroll / join ──────────────────────────────────────────────────────────
+// Called by connection-bridge.js --community-enroll
+//   POST /_nostalgia/community/join
+//   Header: x-nostalgia-community-join: <joinKey>
+//   Body:   { memberKey }
+app.post('/_nostalgia/community/join', (req, res) => {
+  const joinKey = req.headers['x-nostalgia-community-join'];
+  const { memberKey: mk } = req.body || {};
+  if (typeof joinKey !== 'string' || !KEY_RE.test(mk)) {
+    return res.status(400).json({ error: 'request-invalid' });
+  }
+  const result = db.enroll(mk, joinKey);
+  if (!result.ok) {
+    if (result.status === 403) return res.status(403).json({ error: 'join-rejected' });
+    if (result.status === 409) return res.status(409).json({ error: 'community-full' });
+    return res.status(500).json({ error: 'server-error' });
+  }
+  res.status(200).json({ enrollmentVersion: 1, enrolled: true });
+});
 
-// ── 2K20 TCP game server (port 45323) ─────────────────────────────────────────
-// Covid20Redirect.dll opens a raw TCP connection here.
-// The DLL handles all the game-level framing — we just need to accept
-// the connection and keep it alive. Respond with an OK handshake.
-const HANDSHAKE = Buffer.from([
-  0x01, 0x00, 0x00, 0x00,  // magic / version
-  0x00, 0x00, 0x00, 0x00,  // result = 0 (OK)
-  0x01, 0x00, 0x00, 0x00,  // online = 1
-  0x00, 0x00, 0x00, 0x00,  // padding
-]);
+// ── 2. Health ─────────────────────────────────────────────────────────────────
+// The bridge polls this every 10 s. Returns identity + server capability flags.
+app.get('/health', (req, res) => {
+  const mk = getMemberKey(req);
+  if (!mk) return res.status(403).json({ error: 'credentials-missing' });
 
-const gameServer = net.createServer(socket => {
-  const id   = nextId++;
-  const addr = `${socket.remoteAddress}:${socket.remotePort}`;
-  players.set(id, { socket, addr, connectedAt: Date.now() });
-  log(`[GAME] player ${id} connected from ${addr}  (${players.size} online)`);
+  const session = db.getSession(mk);
+  if (!session) return res.status(403).json({ error: 'invite-rejected' });
 
-  // Send handshake so the DLL knows the server accepted
-  socket.write(HANDSHAKE);
-
-  socket.on('data', data => {
-    // Echo a minimal OK response — Covid20 DLL does the real framing
-    // Just keep the pipe alive and ACK with zeros
-    const ack = Buffer.alloc(data.length, 0);
-    try { socket.write(ack); } catch {}
+  res.status(200).json({
+    service:                     'nostalgia-2k19-protocol-gateway',
+    protocolRevision:            '2k19-community-private-v10',
+    // Identity
+    memberIdentityVersion:       1,
+    nativeDisplayNameVersion:    1,
+    memberId:                    session.memberId,
+    memberCode:                  session.memberCode,
+    displayName:                 session.displayName,
+    steamPersonaName:            session.steamPersonaName,
+    steamNameState:              session.steamNameState,
+    nativeUserIdHex:             session.nativeUserIdHex,
+    // Native identity
+    nativeIdentityVersion:       2,
+    // Version gates the bridge checks
+    careerUpgradeVersion:        4,
+    nativeMatchTransportVersion: 2,
+    nativeReplayVersion:         1,
+    nativeUserdataSizeVersion:   1,
+    // Steam feature gate
+    steamLinkVersion:            1,
+    // Park / login state
+    parkJoinState:               session.parkJoinState,
+    parkJoinError:               null,
+    nativeLoginState:            session.nativeLoginState,
+    nativeLoginError:            session.nativeLoginError,
+    careerUpgradeState:          session.careerUpgradeState,
+    careerUpgradeError:          session.careerUpgradeError,
+    // Relay flags
+    gameplayRelayReady:          true,
+    protocolReady:               true,
   });
+});
 
-  socket.on('close', () => {
-    players.delete(id);
-    log(`[GAME] player ${id} disconnected  (${players.size} online)`);
+// ── 3. Locker code redeem ─────────────────────────────────────────────────────
+app.post('/nba/2k19/community/locker-code/redeem', (req, res) => {
+  const mk = getMemberKey(req);
+  if (!mk) return res.status(403).json({ error: 'not-authenticated' });
+  const { code } = req.body || {};
+  const result = db.redeemLockerCode(mk, code);
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  res.status(200).json({ ok: true, vc: result.vc });
+});
+
+// ── 4. Steam link status ──────────────────────────────────────────────────────
+app.get('/nba/2k19/community/steam/link/status', (req, res) => {
+  const mk = getMemberKey(req);
+  if (!mk) return res.status(403).json({ error: 'not-authenticated' });
+  const session = db.getSession(mk);
+  if (!session) return res.status(403).json({ error: 'invite-rejected' });
+  res.status(200).json({
+    steamLinkVersion: 1,
+    steamNameState:   session.steamNameState,
+    steamPersonaName: session.steamPersonaName,
   });
+});
 
-  socket.on('error', () => {
-    players.delete(id);
+// ── 5. Steam link start ───────────────────────────────────────────────────────
+app.post('/nba/2k19/community/steam/link/start', (req, res) => {
+  const mk = getMemberKey(req);
+  if (!mk) return res.status(403).json({ error: 'not-authenticated' });
+  // Stub — return unavailable so the client shows "not linked" cleanly
+  res.status(200).json({ steamLinkVersion: 1, loginUrl: null, status: 'unavailable' });
+});
+
+// ── 6. Steam link confirm ─────────────────────────────────────────────────────
+app.post('/nba/2k19/community/steam/link/confirm', (req, res) => {
+  const mk = getMemberKey(req);
+  if (!mk) return res.status(403).json({ error: 'not-authenticated' });
+  const { steamId, personaName } = req.body || {};
+  if (!steamId || !personaName) return res.status(400).json({ error: 'request-invalid' });
+  db.linkSteam(mk, steamId, personaName);
+  res.status(200).json({ ok: true });
+});
+
+// ── 7. Steam link unlink ──────────────────────────────────────────────────────
+app.post('/nba/2k19/community/steam/link/unlink', (req, res) => {
+  const mk = getMemberKey(req);
+  if (!mk) return res.status(403).json({ error: 'not-authenticated' });
+  db.unlinkSteam(mk);
+  res.status(200).json({ ok: true });
+});
+
+// ── 8. Steam friends snapshot ─────────────────────────────────────────────────
+app.get('/nba/2k19/community/steam/friends/snapshot', (req, res) => {
+  const mk = getMemberKey(req);
+  if (!mk) return res.status(403).json({ error: 'not-authenticated' });
+  res.status(200).json({
+    snapshotVersion: 1,
+    status:          'ready',
+    complete:        true,
+    selfSteamId:     '0',
+    friends:         [],
+    communityFriends: [],
   });
-
-  // Keepalive so the connection doesn't drop
-  socket.setKeepAlive(true, 10000);
-  socket.setTimeout(0);
 });
 
-gameServer.listen(45323, '0.0.0.0', () => {
-  log('[GAME] TCP game server listening on 0.0.0.0:45323');
+// ── 9. Catch-all for /nba/2k19/ ──────────────────────────────────────────────
+app.all('/nba/2k19/*', (_req, res) => {
+  res.status(404).json({ error: 'route-not-supported' });
 });
-gameServer.on('error', e => log(`[GAME] error: ${e.message}`));
 
-// ── Legacy login server (port 30217) ─────────────────────────────────────────
-// Covid20 console shows: "legacy login 21217 -> 30217"
-// The DLL redirects 2K's login port 21217 to our 30217.
-const loginServer = net.createServer(socket => {
-  const addr = `${socket.remoteAddress}:${socket.remotePort}`;
-  log(`[LOGIN] connection from ${addr}`);
-  socket.write(HANDSHAKE);
-  socket.on('data', data => {
-    try { socket.write(Buffer.alloc(data.length, 0)); } catch {}
+// ── HTTP + WebSocket server ───────────────────────────────────────────────────
+const server = http.createServer(app);
+
+// WebSocket: /nba/2k19/park/connect — Park multiplayer relay
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, 'http://localhost');
+  if (url.pathname.toLowerCase() !== '/nba/2k19/park/connect') {
+    socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    return;
+  }
+  const mk = req.headers['x-nostalgia-member-key'] || '';
+  if (!KEY_RE.test(mk) || !db.getSession(mk)) {
+    socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+});
+
+// Simple broadcast relay — every Park client hears everyone else
+const parkClients = new Set();
+wss.on('connection', (ws, req) => {
+  const mk = req.headers['x-nostalgia-member-key'];
+  parkClients.add(ws);
+  console.log(`[park] +connected  ...${mk.slice(-6)}  total=${parkClients.size}`);
+  ws.on('message', data => {
+    for (const c of parkClients) if (c !== ws && c.readyState === 1) c.send(data);
   });
-  socket.on('error', () => {});
-  socket.setKeepAlive(true, 10000);
+  const leave = () => {
+    parkClients.delete(ws);
+    console.log(`[park] -disconnected ...${mk.slice(-6)}  total=${parkClients.size}`);
+  };
+  ws.on('close', leave);
+  ws.on('error', leave);
 });
 
-loginServer.listen(30217, '0.0.0.0', () => {
-  log('[LOGIN] TCP login server listening on 0.0.0.0:30217');
-});
-loginServer.on('error', e => log(`[LOGIN] error: ${e.message}`));
-
-// ── Virtual channel server (port 20055) ───────────────────────────────────────
-const vcServer = net.createServer(socket => {
-  const addr = `${socket.remoteAddress}:${socket.remotePort}`;
-  log(`[VC] connection from ${addr}`);
-  socket.write(HANDSHAKE);
-  socket.on('data', data => {
-    try { socket.write(Buffer.alloc(data.length, 0)); } catch {}
-  });
-  socket.on('error', () => {});
-  socket.setKeepAlive(true, 10000);
+// ── Start ─────────────────────────────────────────────────────────────────────
+server.listen(PORT, () => {
+  console.log('');
+  console.log('  Nostalgia 2K19 Community Server');
+  console.log('  ────────────────────────────────────────');
+  console.log(`  Port          : ${PORT}`);
+  console.log(`  Health check  : http://localhost:${PORT}/health`);
+  console.log(`  Join key      : ${db.JOIN_KEY}`);
+  console.log('');
 });
 
-vcServer.listen(20055, '0.0.0.0', () => {
-  log('[VC] Virtual channel server listening on 0.0.0.0:20055');
-});
-vcServer.on('error', e => log(`[VC] error: ${e.message}`));
-
-// ── HTTP/HTTPS spoof app (dead 2K auth servers) ───────────────────────────────
-const OK = (extra = {}) => ({
-  status: 'success', code: 200, online: true,
-  authenticated: true, valid: true,
-  token: 'PRIVATE_TOKEN', access_token: 'PRIVATE_TOKEN',
-  session_id: 'PRIVATE_SESSION',
-  user_id: 'private_user', display_name: 'Player',
-  vc_balance: 999999999, balance: 999999999,
-  allowed: true, validated: true,
-  expires_in: 86400, maintenance: false,
-  features: {}, config: {}, friends: [],
-  ...extra,
-});
-
-const spoof = express();
-spoof.use(cors());
-spoof.use(express.json());
-spoof.use(express.raw({ type: '*/*', limit: '10mb' }));
-
-spoof.use((req, _res, next) => {
-  log(`[SPOOF] ${req.method} ${req.hostname}${req.path}`);
-  next();
-});
-
-// Steam ticket auth (fixes error 2fd7b735)
-spoof.all('*steamticket*', (_req, res) => res.json(OK()));
-spoof.all('*steam/auth*',  (_req, res) => res.json(OK()));
-
-// Auth / login / session
-spoof.all('*auth*',    (_req, res) => res.json(OK()));
-spoof.all('*login*',   (_req, res) => res.json(OK()));
-spoof.all('*session*', (_req, res) => res.json(OK()));
-
-// Config / liveconfig
-spoof.all('*config*',  (_req, res) => res.json(OK({ patches: [], version: '1.0' })));
-
-// VC / store / entitlements
-spoof.all('*VCReport*',    (_req, res) => res.json(OK({ transactions: [] })));
-spoof.all('*vc*',          (_req, res) => res.json(OK({ items: [] })));
-spoof.all('*store*',       (_req, res) => res.json(OK({ products: [] })));
-spoof.all('*entitlement*', (_req, res) => res.json(OK({ entitlements: [] })));
-
-// Telemetry / analytics (silent discard)
-spoof.all('*telemetry*',  (_req, res) => res.json(OK()));
-spoof.all('*analytics*',  (_req, res) => res.json(OK()));
-
-// Matchmaking / presence / leaderboard
-spoof.all('*matchmaking*',  (_req, res) => res.json(OK({ available: true })));
-spoof.all('*presence*',     (_req, res) => res.json(OK()));
-spoof.all('*leaderboard*',  (_req, res) => res.json(OK({ entries: [] })));
-
-// Status / health
-spoof.get('/status', (_req, res) => res.json({
-  online: true, players: players.size, server: '2K20-private',
-}));
-
-// Catch-all
-spoof.all('*', (_req, res) => res.json(OK()));
-
-// ── Bind HTTP on port 80 ───────────────────────────────────────────────────────
-http.createServer(spoof).listen(80, '0.0.0.0', () => {
-  log('[HTTP] Spoof listening on 0.0.0.0:80');
-}).on('error', e => log(`[HTTP:80] error: ${e.message}`));
-
-// ── Bind HTTPS on port 443 ────────────────────────────────────────────────────
-if (tlsOptions) {
-  https.createServer(tlsOptions, spoof).listen(443, '0.0.0.0', () => {
-    log('[HTTPS] Spoof listening on 0.0.0.0:443');
-  }).on('error', e => log(`[HTTPS:443] error: ${e.message}`));
-}
-
-// ── API on port 3000 (launcher status check) ──────────────────────────────────
-http.createServer(spoof).listen(3000, '0.0.0.0', () => {
-  log('[API] Status API listening on 0.0.0.0:3000');
-}).on('error', e => log(`[API:3000] error: ${e.message}`));
-
-// ── VCReport on port 26135 (HTTPS) ────────────────────────────────────────────
-if (tlsOptions) {
-  https.createServer(tlsOptions, spoof).listen(26135, '0.0.0.0', () => {
-    log('[VCREPORT] Listening on 0.0.0.0:26135');
-  }).on('error', e => log(`[VCREPORT:26135] error: ${e.message}`));
-}
-
-log('');
-log('  NBA 2K20 Private Server ready.');
-log(`  Players online: ${players.size}`);
-log('');
-
-process.on('uncaughtException', e => {
-  log(`[ERROR] ${e.message}`);
-  console.error(e.stack);
+server.on('error', err => {
+  if (err.code === 'EADDRINUSE') console.error(`[!] Port ${PORT} already in use.`);
+  else console.error('[!] Server error:', err.message);
+  process.exit(1);
 });
