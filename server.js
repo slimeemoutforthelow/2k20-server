@@ -48,6 +48,13 @@ const PLAYER_CFG = path.join(__dirname, "player.cfg");
 // On Render the service is behind a TLS-terminating proxy — no cert files needed.
 const IS_RENDER  = !!process.env.RENDER;
 
+// In-memory ring buffer of last 200 requests — readable via GET /logs
+const RECENT = [];
+function pushRecent(entry) {
+  RECENT.push(entry);
+  if (RECENT.length > 200) RECENT.shift();
+}
+
 // ---------------------------------------------------------------------------
 // Player config  (written by the launcher when the user sets their username)
 // ---------------------------------------------------------------------------
@@ -67,6 +74,7 @@ function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
   console.log(line);
   logStream.write(line + "\n");
+  pushRecent(line);
 }
 
 // ---------------------------------------------------------------------------
@@ -478,9 +486,16 @@ function route(res, url, method, body) {
     });
   }
 
-  // POST /DHSession
+  // POST /DHSession  — Demonware session key exchange
+  // Game sends this early; must return a sessionKey that matches what /Session gave.
   if (u === "/dhsession" || u.startsWith("/dhsession/")) {
-    return json(200, { sessionKey: SESSION.sessionKey, userId: 1 });
+    return json(200, {
+      sessionKey:  SESSION.sessionKey,
+      userId:      SESSION.userId,
+      username:    SESSION.username,
+      result:      "SUCCESS",
+      env:         "prod",
+    });
   }
 
   // GET /title/*
@@ -572,6 +587,14 @@ function route(res, url, method, body) {
 
   if (u.includes("/stats") || u.includes("/history") || u.includes("/record")) {
     return json(200, { stats: {}, history: [] });
+  }
+
+  // -------------------------------------------------------------------------
+  // GET /logs  — returns last 200 log lines so we can debug remotely
+  // -------------------------------------------------------------------------
+  if (u === "/logs" || u === "/logs/") {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    return res.end(RECENT.join("\n"));
   }
 
   // -------------------------------------------------------------------------
@@ -699,6 +722,11 @@ if (IS_RENDER) {
 
 // ---------------------------------------------------------------------------
 // TCP stub — :8009  (Demonware raw binary backend)
+//
+// NOTE: Render's health checker also hits this port with plain HTTP.
+// We detect HTTP requests (start with "GET", "POST", "HEAD", "HOST") and
+// return a minimal HTTP 200 so Render stops retrying, then close.
+// Real Demonware traffic starts with binary bytes — we ACK those normally.
 // ---------------------------------------------------------------------------
 const tcpServer = net.createServer((socket) => {
   readProxyHeader(socket).then(({ socket: s, realIp, rest }) => {
@@ -706,6 +734,23 @@ const tcpServer = net.createServer((socket) => {
     log(`[TCP-8009] connect  ${remote}`);
 
     const handleData = (data) => {
+      // Detect HTTP health check (Render pings port 8009 with HTTP)
+      const start = data.slice(0, 4).toString("ascii");
+      if (start === "GET " || start === "POST" || start === "HEAD" || start === "HOST") {
+        log(`[TCP-8009] HTTP health check from ${remote} — returning 200`);
+        s.write(
+          "HTTP/1.1 200 OK\r\n" +
+          "Content-Type: text/plain\r\n" +
+          "Content-Length: 2\r\n" +
+          "Connection: close\r\n" +
+          "\r\n" +
+          "OK"
+        );
+        s.end();
+        return;
+      }
+
+      // Real Demonware binary traffic
       const hex   = data.slice(0, 256).toString("hex").replace(/(.{32})/g, "$1 ").trimEnd();
       const ascii = data.slice(0, 256).toString("ascii").replace(/[^\x20-\x7e]/g, ".");
       log(`[TCP-8009] recv ${data.length}b from ${remote}`);
